@@ -74,7 +74,8 @@ def get_model_answers(
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            input_ids = tokenizer([prompt],add_special_tokens=False,).input_ids
+            input_ids = tokenizer(
+                [prompt], add_special_tokens=False,).input_ids
 
             model.call_to_big = 0
             torch.cuda.synchronize()
@@ -150,7 +151,8 @@ def get_model_answers(
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-                input_ids = tokenizer([prompt], add_special_tokens=False, ).input_ids
+                input_ids = tokenizer(
+                    [prompt], add_special_tokens=False, ).input_ids
 
                 model.call_to_big = 0
                 torch.cuda.synchronize()
@@ -206,7 +208,8 @@ def get_model_answers(
                     "content": output
                 })
 
-            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time})
+            choices.append({"index": i, "turns": turns, "idxs": idxs,
+                           "new_tokens": new_tokens, "wall_time": wall_time})
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
@@ -225,7 +228,8 @@ def get_model_answers(
         for line in fin.readlines():
             data = json.loads(line)
             total_time += sum(sum(c["wall_time"]) for c in data["choices"])
-            total_new_tokens += sum(sum(c["new_tokens"]) for c in data["choices"])
+            total_new_tokens += sum(sum(c["new_tokens"])
+                                    for c in data["choices"])
 
     print(f"Total time: {total_time}, "
           f"Total tokens: {total_new_tokens}, "
@@ -255,7 +259,8 @@ def main(cfg: DictConfig) -> None:
     model_kwargs = hydra.utils.instantiate(cfg.model_kwargs)
     model_class = hydra.utils.instantiate(cfg.method.model_class)
 
-    model_config = hydra.utils.instantiate(cfg.method.model_config) if hasattr(cfg.method, "model_config") else {}
+    model_config = hydra.utils.instantiate(
+        cfg.method.model_config) if hasattr(cfg.method, "model_config") else {}
 
     model = model_class.from_pretrained(
         **model_kwargs,
@@ -270,7 +275,8 @@ def main(cfg: DictConfig) -> None:
 
     output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
 
-    for bench_name in ["alpaca", "gsm8k", "humaneval", "mt_bench", "qa", "sum"]:
+    # for bench_name in ["alpaca", "gsm8k", "humaneval", "mt_bench", "qa", "sum"]:
+    for bench_name in ["mt_bench"]:
         question_file = f"{parent_dir}/data/{bench_name}/question.jsonl"
         answer_file = f"{output_dir}/{bench_name}.jsonl"
 

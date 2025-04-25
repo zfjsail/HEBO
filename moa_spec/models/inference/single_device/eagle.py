@@ -51,14 +51,14 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                  depth,
                  breadth,
                  total_tokens,
-        ):
+                 ):
         super().__init__(config)
         self.call_to_big = 0
         self.default_layer = default_layer
         self.number_of_layers = number_of_layers
 
         if self.default_layer:
-            self.spec_model = LlamaDecoderLayer(config, 0)
+            self.spec_model = nn.ModuleList([LlamaDecoderLayer(config, 0)])
         else:
             config2 = copy.deepcopy(config)
             config2._attn_implementation = "sdpa"
@@ -66,9 +66,14 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
             config2.num_key_value_heads = drafter_num_key_value_heads
             config2.intermediate_size = drafter_intermediate_size
 
-            self.spec_model = nn.ModuleList([LlamaDecoderLayer(config2, i) for i in range(self.number_of_layers)])
+            self.spec_model = nn.ModuleList(
+                [LlamaDecoderLayer(config2, i) for i in range(self.number_of_layers)])
 
-        self.spec_model_fc = nn.Linear(in_features=config.hidden_size * 2, out_features=config.hidden_size, bias=False)
+        self.layers = self.spec_model
+
+        self.spec_model_fc = nn.Linear(
+            in_features=config.hidden_size * 2, out_features=config.hidden_size, bias=False)
+        self.fc = self.spec_model_fc
 
         if not isinstance(self.model, LlamaModelTreeAttentionMask):
             self.model.__class__ = LlamaModelTreeAttentionMask
@@ -102,26 +107,40 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
     def __del__(self):
         if len(self.stats) > 0:
             m_value = max(self.stats)
-            prob = np.histogram(self.stats, bins=np.arange(1, m_value + 2), density=True)
+            prob = np.histogram(self.stats, bins=np.arange(
+                1, m_value + 2), density=True)
             print(f"{np.histogram(self.stats, bins=np.arange(1, m_value + 2))}")
             print(f"{prob}")
-            print(f"avg len: {prob[0] @ np.arange(1, m_value + 2)[:prob[0].shape[0]]}")
+            print(
+                f"avg len: {prob[0] @ np.arange(1, m_value + 2)[:prob[0].shape[0]]}")
 
     def custom_load(self, load_path, dtype):
         state_dict = {}
-        if os.path.exists(os.path.join(load_path, "model.safetensors")):
-            with safe_open(os.path.join(load_path, "model.safetensors"), framework="pt", device=self.device.type) as f:
-                for k in f.keys():
-                    state_dict[k] = f.get_tensor(k).to(dtype=dtype)
+        if os.path.exists(os.path.join(load_path, "model.safetensors")) or os.path.exists(os.path.join(load_path, "pytorch_model.bin")):
+            try:
+                state_dict = torch.load(os.path.join(
+                    load_path, "pytorch_model.bin"), map_location=self.device)
+                for k in state_dict.keys():
+                    state_dict[k] = state_dict[k].to(dtype=dtype)
+            except:
+                with safe_open(os.path.join(load_path, "model.safetensors"), framework="pt", device=self.device.type) as f:
+                    for k in f.keys():
+                        state_dict[k] = f.get_tensor(k).to(dtype=dtype)
         else:
-            raise()
+            raise ()
 
         if state_dict == {}:
             print("WARNING : failed to load previous LLM state")
         else:
-            print(f"LOADING successfully {load_path} states ({len(state_dict)} numbers of keys)")
+            print(
+                f"LOADING successfully {load_path} states ({len(state_dict)} numbers of keys)")
         incompatible_keys = self.load_state_dict(state_dict, strict=False)
-        assert len(incompatible_keys.unexpected_keys) == 0
+        print("incompatible_keys.unexpected_keys",
+              incompatible_keys.unexpected_keys)
+        incompatible_keys = set(
+            incompatible_keys.unexpected_keys) - {"embed_tokens.weight"}
+        # assert len(incompatible_keys.unexpected_keys) == 0
+        assert len(incompatible_keys) == 0
 
     def forward(
         self,
@@ -162,7 +181,8 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
             last_hidden_state = base_model_output.hidden_states[-1]
 
             past_key_values2 = DynamicCache()
-            base_model_output["hidden_states"] = [input_embs[:, 1:], last_hidden_state, last_hidden_state]
+            base_model_output["hidden_states"] = [
+                input_embs[:, 1:], last_hidden_state, last_hidden_state]
             base_model_output["logits"] = self.lm_head(last_hidden_state)
             base_model_output["past_key_values2"] = past_key_values2
             return base_model_output
@@ -181,7 +201,8 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                 new_last_hidden_state = base_model_output.hidden_states[-1]
 
             base_model_output["hidden_states"] = [
-                torch.cat((last_hidden_state[0], base_model_output.hidden_states[0]), 1),
+                torch.cat(
+                    (last_hidden_state[0], base_model_output.hidden_states[0]), 1),
                 torch.cat((last_hidden_state[1], new_last_hidden_state), 1),
                 torch.cat((last_hidden_state[2], new_last_hidden_state), 1)]
 
@@ -190,8 +211,10 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
             return base_model_output
 
         if past_key_values2.get_seq_length() == 0:
-            position_ids2 = torch.arange(cache_position[0], device=input_ids.device)[None]
-            X1 = torch.cat((last_hidden_state[0], self.model.embed_tokens(input_ids)), 1)
+            position_ids2 = torch.arange(
+                cache_position[0], device=input_ids.device)[None]
+            X1 = torch.cat(
+                (last_hidden_state[0], self.model.embed_tokens(input_ids)), 1)
             X2 = last_hidden_state[1]
 
             attn_output = self.spec_model_fc(torch.cat((X1, X2), -1))
@@ -225,14 +248,16 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
 
             base_model_output = {}
             base_model_output["hidden_states"] = [X1,
-                                                  torch.cat((last_hidden_state[1], attn_output[:, -1:]), 1),
+                                                  torch.cat(
+                                                      (last_hidden_state[1], attn_output[:, -1:]), 1),
                                                   last_hidden_state[2]]
             attn_output = attn_output[:, -1:]
         else:
             position_ids2 = cache_position[None] - 1
 
             if gen_step == 1:  # comes in only after recall_big=True
-                added_prev_toks = past_key_values[0][0].shape[2] - past_key_values2[0][0].shape[2] - 1
+                added_prev_toks = past_key_values[0][0].shape[2] - \
+                    past_key_values2[0][0].shape[2] - 1
                 if added_prev_toks > 0:
                     X1 = torch.cat((last_hidden_state[0][:, -added_prev_toks:],
                                     self.model.embed_tokens(input_ids)), 1)
@@ -240,16 +265,20 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                     X1 = self.model.embed_tokens(input_ids)
                 X2 = last_hidden_state[2][:, -added_prev_toks - 1:]
                 causal_mask = torch.full(
-                    (X1.shape[1] + past_key_values2[0][0].shape[2], X1.shape[1] + past_key_values2[0][0].shape[2]),
+                    (X1.shape[1] + past_key_values2[0][0].shape[2],
+                     X1.shape[1] + past_key_values2[0][0].shape[2]),
                     fill_value=self.min_dtype,
                     dtype=self.dtype,
                     device=input_ids.device,
                 )
                 causal_mask = torch.triu(causal_mask, diagonal=1)
                 causal_mask = causal_mask[None, None]
-                tree_masks = causal_mask[:, :, past_key_values2[0][0].shape[2]:]
+                tree_masks = causal_mask[:, :,
+                                         past_key_values2[0][0].shape[2]:]
 
-                position_ids2 = position_ids2 - torch.arange(X2.shape[1] - 1, -1, -1, device=position_ids2.device)
+                position_ids2 = position_ids2 - \
+                    torch.arange(X2.shape[1] - 1, -1, -1,
+                                 device=position_ids2.device)
             elif gen_step == 2:
                 X1 = self.model.embed_tokens(input_ids[:, -self.breadth:])
                 X2 = last_hidden_state[1][:, -1:]
@@ -282,12 +311,14 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
             if gen_step == 1:
                 attn_output = attn_output[:, -1:]
                 base_model_output = {"hidden_states": [torch.cat((last_hidden_state[0], X1[:, -1:]), 1),
-                                                       torch.cat((last_hidden_state[1], attn_output), 1),
+                                                       torch.cat(
+                                                           (last_hidden_state[1], attn_output), 1),
                                                        last_hidden_state[2]
                                                        ]}
             else:
                 base_model_output = {"hidden_states": [last_hidden_state[0],
-                                                       torch.cat((last_hidden_state[1], attn_output), 1),
+                                                       torch.cat(
+                                                           (last_hidden_state[1], attn_output), 1),
                                                        last_hidden_state[2]
                                                        ]}
 
@@ -296,7 +327,6 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
         base_model_output["past_key_values2"] = past_key_values2
 
         return base_model_output
-
 
     @torch.inference_mode()
     def _sample(
@@ -326,7 +356,8 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                 " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
                 UserWarning,
             )
-            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+            stopping_criteria = validate_stopping_criteria(
+                stopping_criteria, max_length)
         assert len(stopping_criteria) == 2  # max length and EosToken
 
         output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
@@ -347,13 +378,16 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
         scores = () if (return_dict_in_generate and output_scores) else None
         decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
         cross_attentions = () if (return_dict_in_generate and output_attentions) else None
-        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+        decoder_hidden_states = () if (
+            return_dict_in_generate and output_hidden_states) else None
 
         # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
         if return_dict_in_generate and self.config.is_encoder_decoder:
-            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_attentions = model_kwargs["encoder_outputs"].get(
+                "attentions") if output_attentions else None
             encoder_hidden_states = (
-                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+                model_kwargs["encoder_outputs"].get(
+                    "hidden_states") if output_hidden_states else None
             )
 
         # keep track of which sequences are already finished
@@ -361,8 +395,10 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
         if "inputs_embeds" in model_kwargs:
             cur_len = model_kwargs["inputs_embeds"].shape[1]
         this_peer_finished = False
-        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        model_kwargs["cache_position"] = torch.arange(cur_len, device=input_ids.device)
+        unfinished_sequences = torch.ones(
+            batch_size, dtype=torch.long, device=input_ids.device)
+        model_kwargs["cache_position"] = torch.arange(
+            cur_len, device=input_ids.device)
         last_hidden_state = None
         past_key_values = model_kwargs.get("past_key_values", None)
         past_key_values2 = None
@@ -380,7 +416,8 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
             model_inputs = dict(past_key_values=past_key_values)
 
             if past_key_values is not None and past_key_values.get_seq_length() > 0:
-                model_inputs["input_ids"] = input_ids[:, past_key_values[0][0].shape[2]:]
+                model_inputs["input_ids"] = input_ids[:,
+                                                      past_key_values[0][0].shape[2]:]
             else:
                 model_inputs["input_ids"] = input_ids
 
@@ -397,11 +434,14 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                     top_scores_index = torch.sort(top_scores_index).values
 
                     draft_tokens = ss_token_list[top_scores_index]
-                    draft_tokens = torch.cat((input_ids[0, valid_tokens:valid_tokens + 1], draft_tokens), dim=0)
+                    draft_tokens = torch.cat(
+                        (input_ids[0, valid_tokens:valid_tokens + 1], draft_tokens), dim=0)
                     model_inputs['input_ids'] = draft_tokens[None]
 
-                    draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // self.breadth].long()
-                    mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
+                    draft_parents = torch.cat(parents_list, dim=0)[
+                        top_scores_index // self.breadth].long()
+                    mask_index = torch.searchsorted(
+                        top_scores_index, draft_parents - 1, right=False)
                     mask_index[draft_parents == 0] = -1
                     mask_index = mask_index + 1
 
@@ -412,14 +452,16 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                         device=mask_index.device,
                     )
 
-                    tree_mask2 = torch.eye(total_tokens + 1, device=mask_index.device).bool()
+                    tree_mask2 = torch.eye(
+                        total_tokens + 1, device=mask_index.device).bool()
                     tree_mask2[:, 0] = True
                     for i in range(total_tokens):
                         tree_mask2[i + 1].add_(tree_mask2[mask_index[i]])
                     tree_mask[tree_mask2] = 0.0
 
                     tree_position_ids = torch.sum(tree_mask2, dim=1) - 1
-                    model_inputs['position_ids'] = (valid_tokens + tree_position_ids)[None]
+                    model_inputs['position_ids'] = (
+                        valid_tokens + tree_position_ids)[None]
                     model_inputs['cache_position'] = model_inputs['position_ids'][0]
 
                     see_all_valid = torch.zeros((tree_mask.shape[0], valid_tokens), dtype=tree_mask.dtype,
@@ -429,14 +471,16 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                 else:
                     model_inputs['cache_position'] = model_inputs['cache_position'] + torch.arange(
                         model_inputs['input_ids'].shape[1], device=model_inputs['cache_position'].device) - \
-                                                     model_inputs['input_ids'].shape[1] + 1
+                        model_inputs['input_ids'].shape[1] + 1
 
                 tree_tok_scores = []
                 tree_tok = []
                 parents_list = []
             else:
-                model_inputs['attention_mask'] = torch.ones_like(model_inputs['input_ids'])
-                model_inputs['position_ids'] = model_inputs['attention_mask'].long().cumsum(-1) - 1
+                model_inputs['attention_mask'] = torch.ones_like(
+                    model_inputs['input_ids'])
+                model_inputs['position_ids'] = model_inputs['attention_mask'].long(
+                ).cumsum(-1) - 1
                 model_inputs['cache_position'] = model_kwargs['cache_position']
 
             # forward pass to get next token
@@ -460,7 +504,8 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                         noleaf_num = len(noleaf_index) - 1
                         leaf_num = total_tokens - noleaf_num
                         max_depth = torch.max(tree_position_ids) + 1
-                        retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long) - 1
+                        retrieve_indices = torch.zeros(
+                            leaf_num, max_depth.item(), dtype=torch.long) - 1
 
                         position_ids_list = tree_position_ids.tolist()
                         mask_index_list = mask_index.tolist()
@@ -476,23 +521,29 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                                 rid += 1
 
                         posterior = outputs["logits"][0, retrieve_indices]
-                        candidates = torch.cat((model_inputs["input_ids"], one_zero), -1)[0, retrieve_indices]
+                        candidates = torch.cat(
+                            (model_inputs["input_ids"], one_zero), -1)[0, retrieve_indices]
                         posterior_mask = (
-                                candidates[:, 1:] == torch.argmax(posterior[:, :-1], dim=-1)
+                            candidates[:, 1:] == torch.argmax(
+                                posterior[:, :-1], dim=-1)
                         ).int()
-                        candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
+                        candidates_accept_length = (
+                            torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
                         accept_length = candidates_accept_length.max()
 
                         # Choose the best candidate
                         if accept_length == 0:
                             # Default to the first candidate if none are accepted
-                            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
+                            best_candidate = torch.tensor(
+                                0, dtype=torch.long, device=candidates.device)
                         else:
-                            best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
+                            best_candidate = torch.argmax(
+                                candidates_accept_length).to(torch.long)
 
                         input_ids = input_ids[:, :valid_tokens]
                         input_ids = torch.cat(
-                            [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)],
+                            [input_ids, candidates[None, best_candidate,
+                                                   : accept_length + 1].to(input_ids.device)],
                             dim=-1
                         )
 
@@ -505,24 +556,29 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                                 input_ids = input_ids[:, :valid_tokens + i + 2]
                                 break
                         if this_peer_finished:
-                            averaged_accepted_len.append(input_ids.shape[1] - valid_tokens)
+                            averaged_accepted_len.append(
+                                input_ids.shape[1] - valid_tokens)
                             break
 
                         averaged_accepted_len.append(accept_length.item() + 1)
 
                         select_indices = (
-                                retrieve_indices[best_candidate, : accept_length + 1] + valid_tokens
+                            retrieve_indices[best_candidate,
+                                             : accept_length + 1] + valid_tokens
                         )
                         for i in range(nb_layers):
                             for k in range(2):
                                 layer_cache = outputs['past_key_values'][i]
                                 tgt = layer_cache[k][..., select_indices, :]
-                                dst = layer_cache[k][..., valid_tokens: valid_tokens + tgt.shape[-2], :]
+                                dst = layer_cache[k][...,
+                                                     valid_tokens: valid_tokens + tgt.shape[-2], :]
                                 dst.copy_(tgt, non_blocking=True)
 
-                        outputs["logits"] = posterior[best_candidate, accept_length][None, None]
+                        outputs["logits"] = posterior[best_candidate,
+                                                      accept_length][None, None]
                     else:
-                        verifier = model_inputs["input_ids"][0, 1:] == outputs["logits"][0, :-1].argmax(-1)
+                        verifier = model_inputs["input_ids"][0,
+                                                             1:] == outputs["logits"][0, :-1].argmax(-1)
                         nb_verified_tokens = 1 + torch.cat(
                             (verifier, torch.zeros_like(verifier[0:1]))
                         ).int().argmin().item()
@@ -532,7 +588,8 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                         # check stopping criterion:
                         for i in range(input_ids.shape[1] - model_inputs["input_ids"].shape[1] + 1,
                                        tot_verified_tokens):
-                            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids[:, :i + 1], None)
+                            unfinished_sequences = unfinished_sequences & ~stopping_criteria(
+                                input_ids[:, :i + 1], None)
                             this_peer_finished = unfinished_sequences.max() == 0
                             if this_peer_finished:
                                 input_ids = input_ids[:, :i + 1]
@@ -542,21 +599,25 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                         input_ids = input_ids[:, :tot_verified_tokens]
                         averaged_accepted_len.append(nb_verified_tokens)
 
-                        outputs["logits"] = outputs["logits"][:, :nb_verified_tokens]
+                        outputs["logits"] = outputs["logits"][:,
+                                                              :nb_verified_tokens]
 
                     outputs["past_key_values"].crop(input_ids.shape[-1])
                     past_key_values2.crop(valid_tokens)
                     outputs["past_key_values2"] = past_key_values2
 
                     outputs["hidden_states"][2][:, valid_tokens: valid_tokens + select_indices.shape[0]] = \
-                    outputs["hidden_states"][2][:, select_indices]
-                    outputs["hidden_states"][2] = outputs["hidden_states"][2][:, :input_ids.shape[1]]
+                        outputs["hidden_states"][2][:, select_indices]
+                    outputs["hidden_states"][2] = outputs["hidden_states"][2][:,
+                                                                              :input_ids.shape[1]]
                     outputs["hidden_states"][1] = outputs["hidden_states"][2]
                     outputs["hidden_states"][0][:, valid_tokens - 1: valid_tokens - 1 + select_indices.shape[0]] = \
-                    outputs["hidden_states"][0][:, select_indices]
-                    outputs["hidden_states"][0] = outputs["hidden_states"][0][:, :input_ids.shape[1] - 1]
+                        outputs["hidden_states"][0][:, select_indices]
+                    outputs["hidden_states"][0] = outputs["hidden_states"][0][:,
+                                                                              :input_ids.shape[1] - 1]
 
-                    model_kwargs['attention_mask'] = model_kwargs['attention_mask'][:, :input_ids.shape[1]]
+                    model_kwargs['attention_mask'] = model_kwargs['attention_mask'][:,
+                                                                                    :input_ids.shape[1]]
                     model_kwargs['cache_position'][-1:] = input_ids.shape[1] - 1
 
                 past_key_values = outputs["past_key_values"]
@@ -570,7 +631,8 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
 
             if self.tree_decoding:
                 if gen_step == 0:
-                    next_token_logits = outputs["logits"][:, -1, :].log_softmax(-1)
+                    next_token_logits = outputs["logits"][:, -
+                                                          1, :].log_softmax(-1)
                 else:
                     next_token_logits = outputs["logits"].log_softmax(-1)
             else:
@@ -587,7 +649,8 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                     raw_logits += (next_token_logits,)
                 if output_attentions:
                     decoder_attentions += (
-                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (
+                            outputs.attentions,)
                     )
                     if self.config.is_encoder_decoder:
                         cross_attentions += (outputs.cross_attentions,)
@@ -609,14 +672,18 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                         device=input_ids.device
                     )
                 elif gen_step == 1:
-                    topk_ind_val = torch.topk(next_tokens_scores.view(-1), self.breadth, dim=-1)
+                    topk_ind_val = torch.topk(
+                        next_tokens_scores.view(-1), self.breadth, dim=-1)
                     next_tokens, topk_cs_p = topk_ind_val.indices, topk_ind_val.values
-                    tree_masks = torch.cat((tree_masks.repeat(1, 1, self.breadth, 1), self.init_tree_mask), dim=3)
+                    tree_masks = torch.cat(
+                        (tree_masks.repeat(1, 1, self.breadth, 1), self.init_tree_mask), dim=3)
 
                     tree_tok_scores.append(topk_cs_p[None])
                     tree_tok.append(next_tokens[None])
-                    parents_list.append(torch.zeros(1, dtype=torch.long, device=topk_cs_p.device))
-                    topk_cs_index = torch.arange(self.breadth, device=topk_cs_p.device)
+                    parents_list.append(torch.zeros(
+                        1, dtype=torch.long, device=topk_cs_p.device))
+                    topk_cs_index = torch.arange(
+                        self.breadth, device=topk_cs_p.device)
                 else:
                     ii = (gen_step - 2)
                     bias1 = self.breadth if ii > 0 else 0
@@ -625,19 +692,23 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
                     parents = (topk_cs_index + bias)
                     parents_list.append(parents)
 
-                    topk_ind_val2 = torch.topk(next_tokens_scores, self.breadth, dim=-1)
+                    topk_ind_val2 = torch.topk(
+                        next_tokens_scores, self.breadth, dim=-1)
                     next_tokens2, topk_cs_p2 = topk_ind_val2.indices, topk_ind_val2.values
 
                     cu_scores = topk_cs_p2 + topk_cs_p[:, None]
 
-                    topk_cs = torch.topk(cu_scores.view(-1), self.breadth, dim=-1)
+                    topk_cs = torch.topk(
+                        cu_scores.view(-1), self.breadth, dim=-1)
                     topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
 
                     out_ids = topk_cs_index // self.breadth
                     next_tokens = next_tokens2.view(-1)[topk_cs_index]
 
-                    last_hidden_state[1][:, -self.breadth:] = last_hidden_state[1][:, -self.breadth + out_ids]
-                    tree_masks = torch.cat((tree_masks[:, :, out_ids], self.init_tree_mask), dim=3)
+                    last_hidden_state[1][:, -
+                                         self.breadth:] = last_hidden_state[1][:, -self.breadth + out_ids]
+                    tree_masks = torch.cat(
+                        (tree_masks[:, :, out_ids], self.init_tree_mask), dim=3)
 
                     tree_tok_scores.append(cu_scores[0])
                     tree_tok.append(next_tokens2[0])
@@ -656,7 +727,8 @@ class EAGLELlamaForCausalLM(LlamaForCausalLM):
 
             # if eos_token was found in one sentence, set sentence to finished
             if not self.verification or gen_step == 0:
-                unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+                unfinished_sequences = unfinished_sequences & ~stopping_criteria(
+                    input_ids, scores)
                 this_peer_finished = unfinished_sequences.max() == 0
 
             gen_step += 1
